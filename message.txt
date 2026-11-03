@@ -1,0 +1,1845 @@
+--[[
+    BrainFind v14 | card GUI, text-based detection, multi-host server hop
+    Tabs: Brainrots | Players | Server Hop | Settings
+
+    v14 changes:
+    - Detection reads the "$X/s" text the game displays (includes mutations),
+      and keeps the old data-table lookup as a fallback.
+    - Rounded card GUI, softer palette, Top 5 finds list.
+    - New server hop: tries two hosts, falls back to a random teleport. Hop Method dropdown.
+
+    Latest edit:
+    - Scans bases only (the Plots folder).
+    - If the best brainrot leaves, the ESP instantly falls back to the next best one.
+
+    OPTIONAL: put the raw link of THIS script below so it re-runs by itself
+    after every server hop (uses queue_on_teleport). Or put the file in your
+    executor's autoexec folder.
+]]
+local SCRIPT_URL = ""
+
+------------------------------------------------------------------ services
+local genv = (getgenv and getgenv()) or _G
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = workspace
+local player = Players.LocalPlayer
+
+local hadOld = (genv.BRNT_TOKEN or 0) > 0
+genv.BRNT_TOKEN = (genv.BRNT_TOKEN or 0) + 1
+local MY_TOKEN = genv.BRNT_TOKEN
+local function alive() return genv.BRNT_TOKEN == MY_TOKEN end
+
+if hadOld and cleardrawcache then pcall(cleardrawcache) end
+
+-- remove leftovers of older versions
+pcall(function()
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        local n = inst.Name
+        if n == "BRNT_ESP" or n == "BRNT_TOP" or n == "BRNT_BEST" or n == "BRNT_MIN" or n == "BRNT_PLR" or n == "BRNT_BASE" then
+            inst:Destroy()
+        end
+    end
+end)
+pcall(function()
+    local roots = { CoreGui, player:FindFirstChildOfClass("PlayerGui") }
+    if gethui then table.insert(roots, gethui()) end
+    for _, r in ipairs(roots) do
+        local old = r and r:FindFirstChild("BRNT_GUI")
+        if old then old:Destroy() end
+    end
+end)
+
+------------------------------------------------------------------ fonts
+local F = {
+    reg = Enum.Font.BuilderSans,
+    med = Enum.Font.BuilderSansMedium,
+    bold = Enum.Font.BuilderSansBold,
+    heavy = Enum.Font.BuilderSansExtraBold,
+}
+
+------------------------------------------------------------------ files / config
+local CONFIG_FILE = "BRNT_config.json"
+local SERVERS_FILE = "BRNT_servers.json"
+local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+
+local function readJSON(file, default)
+    if not canFile then return default end
+    local ok, res = pcall(function()
+        if isfile(file) then return HttpService:JSONDecode(readfile(file)) end
+    end)
+    if ok and type(res) == "table" then return res end
+    return default
+end
+local function writeJSON(file, t)
+    if not canFile then return end
+    pcall(function() writefile(file, HttpService:JSONEncode(t)) end)
+end
+
+local defaults = {
+    brainEsp = true, brainTracer = true, brainAll = false,
+    hideOwn = true, markBase = true,
+    minValue = "1m",
+    plrEsp = false, plrHighlight = true, plrNames = true, plrDistance = true,
+    plrTracer = false, plrTeam = false, plrColor = "Red",
+    autoHop = false, scanWait = 6, expireMin = 30, hopMode = "Auto",
+    menuKey = "RightShift",
+    showFab = true, anim = true, openOnLoad = true, lockWin = false, notify = true,
+    menuScale = 1, menuAlpha = 0,
+    winPos = { 0.5, 0.5 }, fabPos = { 0.05, 0.5 },
+}
+local cfg = readJSON(CONFIG_FILE, {})
+for k, v in pairs(defaults) do if cfg[k] == nil then cfg[k] = v end end
+local function saveCfg() writeJSON(CONFIG_FILE, cfg) end
+
+local visited = readJSON(SERVERS_FILE, {})
+local refreshSaved -- forward declaration (UI sets it)
+local function saveVisited() writeJSON(SERVERS_FILE, visited) end
+local function findVisited(id)
+    for _, e in ipairs(visited) do if e.id == id then return e end end
+end
+local function markVisited(id, best)
+    if not id or id == "" then return end
+    local e = findVisited(id)
+    if e then
+        e.t = os.time()
+        if best then e.best = best end
+    else
+        table.insert(visited, { id = id, t = os.time(), best = best })
+    end
+    while #visited > 150 do table.remove(visited, 1) end
+    saveVisited()
+    if refreshSaved then refreshSaved() end
+end
+local function isRecent(id)
+    local e = findVisited(id)
+    return e and (os.time() - e.t) < (tonumber(cfg.expireMin) or 30) * 60
+end
+
+------------------------------------------------------------------ helpers
+local function parseValue(s)
+    s = (tostring(s):lower():gsub("[,%s%$]", ""))
+    local num, suf = s:match("^([%d%.]+)([kmbt]?)$")
+    if not num then return nil end
+    local mult = { k = 1e3, m = 1e6, b = 1e9, t = 1e12 }
+    local n = tonumber(num)
+    if not n then return nil end
+    return n * (mult[suf] or 1)
+end
+local function fmt(n)
+    local u = { { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
+    for _, x in ipairs(u) do
+        if n >= x[1] then
+            local s = string.format("%.2f", n / x[1])
+            s = (s:gsub("%.?0+$", ""))
+            return s .. x[2]
+        end
+    end
+    return tostring(math.floor(n))
+end
+local function minVal() return parseValue(cfg.minValue) or 0 end
+local function ago(t)
+    local m = math.floor((os.time() - t) / 60)
+    if m < 1 then return "just now" end
+    if m < 60 then return m .. "m ago" end
+    return math.floor(m / 60) .. "h ago"
+end
+local function httpGet(url)
+    local ok, res = pcall(function() return game:HttpGet(url) end)
+    if ok and res then return res end
+    local req = (syn and syn.request) or http_request or request
+    if req then
+        local ok2, r = pcall(req, { Url = url, Method = "GET" })
+        if ok2 and r then return r.Body end
+    end
+end
+local function copy(text)
+    if setclipboard then pcall(setclipboard, text) return true end
+    return false
+end
+
+------------------------------------------------------------------ brainrot data
+local lookup = {}
+task.spawn(function()
+    local ok, index = pcall(function()
+        local d = game:GetService("ReplicatedStorage"):WaitForChild("Datas", 15)
+        return require(d:WaitForChild("Animals", 15))
+    end)
+    if ok and type(index) == "table" then
+        for k, v in pairs(index) do
+            if typeof(v) == "table" and v.Generation then
+                lookup[string.lower(k)] = v
+                if v.DisplayName then lookup[string.lower(v.DisplayName)] = v end
+            end
+        end
+    end
+end)
+local function getGen(name)
+    local e = lookup[string.lower(name)]
+    if e then return e.Generation or 0 end
+    local base = string.match(name, "^(.-)%s*[%[%(]")
+    if base and lookup[string.lower(base)] then return lookup[string.lower(base)].Generation or 0 end
+    return nil
+end
+local function findRoot(m)
+    if m:IsA("BasePart") then return m end
+    return m.PrimaryPart or m:FindFirstChild("RootPart") or m:FindFirstChildWhichIsA("BasePart", true)
+end
+
+------------------------------------------------------------------ drawing helpers
+local DrawingOK = pcall(function() return Drawing end) and Drawing ~= nil
+local allLines = {}
+local function newLine(color)
+    if not DrawingOK then return nil end
+    local ok, l = pcall(function() return Drawing.new("Line") end)
+    if not ok then return nil end
+    l.Thickness = 2
+    l.Transparency = 1
+    l.Color = color
+    l.Visible = false
+    table.insert(allLines, l)
+    return l
+end
+local function killLine(l)
+    if not l then return end
+    pcall(function() l.Visible = false end)
+    pcall(function() l:Remove() end)
+end
+
+local GOLD = Color3.fromRGB(255, 215, 0)
+local CYAN = Color3.fromRGB(80, 220, 255)
+local GREEN = Color3.fromRGB(70, 220, 120)
+local PCOL = {
+    Red = Color3.fromRGB(255, 60, 60), Blue = Color3.fromRGB(70, 140, 255),
+    Green = Color3.fromRGB(80, 255, 120), White = Color3.fromRGB(255, 255, 255),
+    Purple = Color3.fromRGB(170, 90, 255), Orange = Color3.fromRGB(255, 150, 40),
+}
+
+------------------------------------------------------------------ base finder
+local S = {
+    bestGen = 0, bestName = nil, bestModel = nil, count = 0, scanned = false,
+    myPlot = nil, baseWhy = "not found", manualPlot = nil, guessPlot = nil,
+    ranked = {}, gensMap = {}, namesMap = {},
+}
+
+local OWNER_KEYS = { "Owner", "OwnerId", "OwnerUserId", "OwnerName", "UserId", "Player", "PlayerName" }
+
+local function matchesMe(v)
+    if v == nil then return false end
+    if typeof(v) == "Instance" then return v == player end
+    local s = tostring(v):lower()
+    if s == "" then return false end
+    return s == tostring(player.UserId) or s == player.Name:lower() or s == player.DisplayName:lower()
+end
+
+local function plotOwnedByMe(plot)
+    -- 1) attributes on the plot
+    for _, key in ipairs(OWNER_KEYS) do
+        local ok, v = pcall(function() return plot:GetAttribute(key) end)
+        if ok and matchesMe(v) then return true end
+    end
+    -- 2) value objects on the plot
+    for _, key in ipairs(OWNER_KEYS) do
+        local o = plot:FindFirstChild(key)
+        if o and (o:IsA("ObjectValue") or o:IsA("StringValue") or o:IsA("IntValue") or o:IsA("NumberValue")) then
+            if matchesMe(o.Value) then return true end
+        end
+    end
+    -- 3) plot sign (YourBase marker or "<name>'s Base" text)
+    local sign = plot:FindFirstChild("PlotSign")
+    if sign then
+        local yb = sign:FindFirstChild("YourBase", true)
+        if yb then
+            local ok, en = pcall(function() return yb.Enabled end)
+            if ok and en == true then return true end
+            local ok2, vis = pcall(function() return yb.Visible end)
+            if ok2 and vis == true then return true end
+        end
+        local n, dn = player.Name:lower(), player.DisplayName:lower()
+        for _, d in ipairs(sign:GetDescendants()) do
+            if d:IsA("TextLabel") then
+                local t = d.Text:lower()
+                if t ~= "" and (t:find(n .. "'s", 1, true) or t:find(dn .. "'s", 1, true)
+                    or t:find(n .. "’s", 1, true) or t:find(dn .. "’s", 1, true)) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function plotPos(plot)
+    local ok, cf = pcall(function() return plot:GetPivot() end)
+    if ok and cf then return cf.Position end
+    local p = plot:FindFirstChildWhichIsA("BasePart", true)
+    return p and p.Position
+end
+
+local function nearestPlot(plots)
+    plots = plots or Workspace:FindFirstChild("Plots")
+    local char = player.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (plots and hrp) then return nil end
+    local best, bd
+    for _, plot in ipairs(plots:GetChildren()) do
+        local pos = plotPos(plot)
+        if pos then
+            local d = (pos - hrp.Position).Magnitude
+            if not bd or d < bd then best, bd = plot, d end
+        end
+    end
+    return best
+end
+
+local function detectBase(plots)
+    if S.manualPlot and S.manualPlot.Parent == plots then
+        S.myPlot, S.baseWhy = S.manualPlot, "manual"
+        return
+    end
+    for _, plot in ipairs(plots:GetChildren()) do
+        if plotOwnedByMe(plot) then
+            S.myPlot, S.baseWhy = plot, "detected"
+            return
+        end
+    end
+    if S.guessPlot and S.guessPlot.Parent == plots then
+        S.myPlot, S.baseWhy = S.guessPlot, "guess (nearest plot)"
+        return
+    end
+    S.myPlot, S.baseWhy = nil, "not found"
+    local g = nearestPlot(plots)
+    if g then
+        S.guessPlot = g
+        S.myPlot, S.baseWhy = g, "guess (nearest plot)"
+    end
+end
+
+local baseTag
+local function updateBaseTag()
+    local plot = (cfg.markBase and S.myPlot) or nil
+    if baseTag and baseTag.plot == plot and baseTag.bb.Parent then return end
+    if baseTag then pcall(function() baseTag.bb:Destroy() end) baseTag = nil end
+    if not plot then return end
+    local part = plot:FindFirstChildWhichIsA("BasePart", true)
+    if not part then return end
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "BRNT_BASE"
+    bb.Adornee = part
+    bb.Size = UDim2.new(0, 240, 0, 36)
+    bb.StudsOffset = Vector3.new(0, 14, 0)
+    bb.AlwaysOnTop = true
+    bb.MaxDistance = 3000
+    local lb = Instance.new("TextLabel")
+    lb.Size = UDim2.new(1, 0, 1, 0)
+    lb.BackgroundTransparency = 1
+    lb.Font = F.heavy
+    lb.TextSize = 22
+    lb.TextStrokeTransparency = 0
+    lb.TextColor3 = GREEN
+    lb.Text = "YOUR BASE"
+    lb.Parent = bb
+    bb.Parent = part
+    baseTag = { plot = plot, bb = bb }
+end
+
+------------------------------------------------------------------ brainrot ESP logic
+local tags = {}
+local setBrainStatus = function() end
+local setHopStatus = function() end
+
+local function untag(m)
+    local t = tags[m]
+    if t then
+        pcall(function() t.hl:Destroy() end)
+        pcall(function() t.bb:Destroy() end)
+        tags[m] = nil
+    end
+end
+local function tag(m, gen, kind)
+    local t = tags[m]
+    if t and t.kind == kind and t.gen == gen then return end
+    untag(m)
+    local part = findRoot(m)
+    if not part then return end
+    local col = (kind == "best") and GOLD or CYAN
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "BRNT_BEST"
+    hl.FillColor = col
+    hl.OutlineColor = Color3.new(1, 1, 1)
+    hl.FillTransparency = 0.35
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Adornee = m
+    hl.Parent = m
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "BRNT_BEST"
+    bb.Adornee = part
+    bb.Size = UDim2.new(0, 360, 0, 48)
+    bb.StudsOffset = Vector3.new(0, 6.5, 0)
+    bb.AlwaysOnTop = true
+    bb.MaxDistance = 3000
+    local lb = Instance.new("TextLabel")
+    lb.Size = UDim2.new(1, 0, 1, 0)
+    lb.BackgroundTransparency = 1
+    lb.Font = F.heavy
+    lb.TextSize = 24
+    lb.TextStrokeTransparency = 0
+    lb.Text = ((kind == "best") and "BEST  $" or "$") .. fmt(gen) .. "/s"
+    lb.TextColor3 = col
+    lb.Parent = bb
+    bb.Parent = part
+    tags[m] = { kind = kind, gen = gen, hl = hl, bb = bb }
+end
+
+local scanning = false
+local GEN_PATTERN = "([%d,%.]+)%s*([KkMmBbTt]?)%s*/%s*[sS]"
+
+local function textGen(txt)
+    if type(txt) ~= "string" or txt == "" then return nil end
+    txt = (txt:gsub("<[^>]+>", ""))
+    local num, suf = txt:match(GEN_PATTERN)
+    if not num then return nil end
+    num = num:gsub(",", "")
+    return parseValue(num .. suf)
+end
+
+local function plotOf(inst, plots)
+    if not plots then return nil end
+    while inst and inst.Parent do
+        if inst.Parent == plots then return inst end
+        inst = inst.Parent
+    end
+end
+
+local function ownerOf(lb, plots)
+    local inst, fallback = lb, nil
+    while inst and inst ~= Workspace do
+        if inst:IsA("Attachment") then fallback = inst.Parent end
+        if inst:IsA("BasePart") and not fallback then fallback = inst end
+        if plots and inst.Parent == plots then break end
+        if inst:IsA("Model") then return inst end
+        inst = inst.Parent
+    end
+    return fallback
+end
+
+local function scanBrainrots()
+    if scanning then return end
+    scanning = true
+    local ok, err = pcall(function()
+        local plots = Workspace:FindFirstChild("Plots")
+        if plots then
+            detectBase(plots)
+        else
+            -- bases only: nothing to scan without the Plots folder
+            S.myPlot, S.baseWhy = nil, "no Plots folder"
+            S.ranked, S.gensMap, S.namesMap = {}, {}, {}
+            S.top, S.count, S.ownCount = {}, 0, 0
+            S.bestModel, S.bestGen, S.bestName = nil, 0, nil
+            S.scanned = true
+            for m in pairs(tags) do untag(m) end
+            setBrainStatus()
+            return
+        end
+
+        local found, names, owner = {}, {}, {}
+
+        -- 1) read the "$X/s" text the game shows (includes mutations), bases only
+        local n = 0
+        for _, d in ipairs(plots:GetDescendants()) do
+            n = n + 1
+            if n % 4000 == 0 then task.wait() end
+            if d:IsA("TextLabel") and d.Visible and d.Text ~= "" and d.Parent then
+                local g = textGen(d.Text)
+                if g and g > 0 then
+                    local bg = d:FindFirstAncestorWhichIsA("BillboardGui")
+                    if not (bg and (string.sub(bg.Name, 1, 4) == "BRNT" or bg.Enabled == false)) then
+                        local key = ownerOf(d, plots)
+                        if key and (not found[key] or g > found[key]) then
+                            found[key] = g
+                            owner[key] = plotOf(key, plots)
+                            local dn = d.Parent:FindFirstChild("DisplayName")
+                            names[key] = (dn and dn:IsA("TextLabel") and dn.Text ~= "" and dn.Text) or key.Name
+                        end
+                    end
+                end
+            end
+        end
+
+        -- 2) fallback: base value from the game's data table (skips ones already found)
+        local positions = {}
+        for key in pairs(found) do
+            local part = key.Parent and findRoot(key)
+            if part then positions[#positions + 1] = part.Position end
+        end
+        for _, plot in ipairs(plots:GetChildren()) do
+            for _, model in ipairs(plot:GetChildren()) do
+                if model:IsA("Model") and not found[model] then
+                    local g = getGen(model.Name)
+                    if g and g > 0 then
+                        local part = findRoot(model)
+                        local dup = false
+                        if part then
+                            for _, p in ipairs(positions) do
+                                if (p - part.Position).Magnitude < 8 then dup = true break end
+                            end
+                        end
+                        if not dup then
+                            found[model], names[model], owner[model] = g, model.Name, plot
+                        end
+                    end
+                end
+            end
+        end
+
+        -- build list
+        local list, gens, ownCount = {}, {}, 0
+        for key, g in pairs(found) do
+            if key.Parent then
+                local mine = owner[key] ~= nil and owner[key] == S.myPlot
+                if mine then ownCount = ownCount + 1 end
+                if not (mine and cfg.hideOwn) then
+                    list[#list + 1] = key
+                    gens[key] = g
+                end
+            end
+        end
+        table.sort(list, function(a, b) return gens[a] > gens[b] end)
+        local best = list[1]
+
+        -- keep the ranked list so the ESP can fall back instantly when the best one leaves
+        S.ranked, S.gensMap, S.namesMap = list, gens, names
+
+        S.top = {}
+        for i = 1, math.min(5, #list) do S.top[i] = { name = names[list[i]], gen = gens[list[i]] } end
+        S.count = #list
+        S.ownCount = ownCount
+        S.bestModel = best
+        S.bestGen = best and gens[best] or 0
+        S.bestName = best and names[best] or nil
+        S.scanned = true
+
+        local desired = {}
+        if cfg.brainEsp then
+            if best then desired[best] = "best" end
+            if cfg.brainAll then
+                local mv = minVal()
+                for _, m in ipairs(list) do
+                    if m ~= best and gens[m] >= mv then desired[m] = "min" end
+                end
+            end
+        end
+        for m in pairs(tags) do
+            if desired[m] == nil or not m.Parent then untag(m) end
+        end
+        for m, kind in pairs(desired) do tag(m, gens[m], kind) end
+
+        updateBaseTag()
+
+        local e = findVisited(game.JobId)
+        if e and S.bestGen > 0 and e.best ~= S.bestGen then
+            e.best = S.bestGen
+            saveVisited()
+            if refreshSaved then refreshSaved() end
+        end
+        setBrainStatus()
+    end)
+    scanning = false
+    if not ok then warn("[BrainFind] scan error: " .. tostring(err)) end
+end
+
+-- fallback: if the best brainrot leaves its base, jump to the next best one right away
+local function stillInBase(m)
+    local plots = Workspace:FindFirstChild("Plots")
+    return m ~= nil and m.Parent ~= nil and plots ~= nil and m:IsDescendantOf(plots)
+end
+
+local function promoteBest()
+    local old = S.bestModel
+    if not old or stillInBase(old) then return end
+    untag(old)
+    S.bestModel, S.bestGen, S.bestName = nil, 0, nil
+    for _, m in ipairs(S.ranked or {}) do
+        if m ~= old and stillInBase(m) then
+            S.bestModel = m
+            S.bestGen = S.gensMap[m] or 0
+            S.bestName = S.namesMap[m]
+            if cfg.brainEsp then tag(m, S.bestGen, "best") end
+            break
+        end
+    end
+    -- refresh the top list from what is still there
+    S.top = {}
+    local c = 0
+    for _, m in ipairs(S.ranked or {}) do
+        if stillInBase(m) then
+            c = c + 1
+            if c <= 5 then S.top[c] = { name = S.namesMap[m], gen = S.gensMap[m] } end
+        end
+    end
+    S.count = c
+    pcall(setBrainStatus)
+end
+
+task.spawn(function()
+    while alive() do
+        pcall(scanBrainrots)
+        task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    while alive() do
+        pcall(promoteBest)
+        task.wait(0.25)
+    end
+end)
+
+------------------------------------------------------------------ player ESP logic
+local plrObjs = {}
+local function destroyPlr(p)
+    local o = plrObjs[p]
+    if not o then return end
+    pcall(function() o.hl:Destroy() end)
+    pcall(function() o.bb:Destroy() end)
+    killLine(o.line)
+    plrObjs[p] = nil
+end
+
+local brainLine = newLine(GOLD)
+local conns = {}
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(conns, c)
+    return c
+end
+
+bind(Players.PlayerRemoving, destroyPlr)
+
+bind(RunService.RenderStepped, function()
+    if not alive() then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    -- brainrot tracer
+    if brainLine then
+        local show = false
+        if cfg.brainEsp and cfg.brainTracer and S.bestModel and S.bestModel.Parent then
+            local char = player.Character
+            local head = char and char:FindFirstChild("Head")
+            local part = findRoot(S.bestModel)
+            if head and part then
+                local sp, on = cam:WorldToViewportPoint(part.Position)
+                if on then
+                    local p1 = cam:WorldToViewportPoint(head.Position)
+                    brainLine.From = Vector2.new(p1.X, p1.Y)
+                    brainLine.To = Vector2.new(sp.X, sp.Y)
+                    show = true
+                end
+            end
+        end
+        brainLine.Visible = show
+    end
+
+    -- player ESP
+    if not cfg.plrEsp then
+        if next(plrObjs) then
+            for p in pairs(plrObjs) do destroyPlr(p) end
+        end
+        return
+    end
+    local col = PCOL[cfg.plrColor] or PCOL.Red
+    local myChar = player.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            local char = p.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local head = char and char:FindFirstChild("Head")
+            local skip = (not hrp) or (not head) or (cfg.plrTeam and p.Team ~= nil and p.Team == player.Team)
+            if skip then
+                destroyPlr(p)
+            else
+                local o = plrObjs[p]
+                if o and o.char ~= char then destroyPlr(p) o = nil end
+                if not o then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "BRNT_PLR"
+                    hl.FillTransparency = 0.6
+                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                    hl.Adornee = char
+                    hl.Parent = char
+                    local bb = Instance.new("BillboardGui")
+                    bb.Name = "BRNT_PLR"
+                    bb.Adornee = head
+                    bb.Size = UDim2.new(0, 240, 0, 46)
+                    bb.StudsOffset = Vector3.new(0, 2.8, 0)
+                    bb.AlwaysOnTop = true
+                    bb.MaxDistance = 5000
+                    local lb = Instance.new("TextLabel")
+                    lb.Size = UDim2.new(1, 0, 1, 0)
+                    lb.BackgroundTransparency = 1
+                    lb.Font = F.bold
+                    lb.TextSize = 18
+                    lb.TextStrokeTransparency = 0.3
+                    lb.Parent = bb
+                    bb.Parent = head
+                    o = { char = char, hl = hl, bb = bb, lb = lb, line = newLine(col) }
+                    plrObjs[p] = o
+                end
+                o.hl.Enabled = cfg.plrHighlight
+                o.hl.FillColor = col
+                o.hl.OutlineColor = Color3.new(1, 1, 1)
+                o.bb.Enabled = cfg.plrNames or cfg.plrDistance
+                o.lb.TextColor3 = col
+                local text = ""
+                if cfg.plrNames then text = p.DisplayName end
+                if cfg.plrDistance and myRoot then
+                    local d = math.floor((hrp.Position - myRoot.Position).Magnitude)
+                    text = text .. ((text ~= "") and "\n" or "") .. "[" .. d .. " studs]"
+                end
+                o.lb.Text = text
+                if o.line then
+                    local show = false
+                    if cfg.plrTracer then
+                        local sp, on = cam:WorldToViewportPoint(hrp.Position)
+                        if on then
+                            o.line.Color = col
+                            o.line.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                            o.line.To = Vector2.new(sp.X, sp.Y)
+                            show = true
+                        end
+                    end
+                    o.line.Visible = show
+                end
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------------ server hop logic
+local hopping = false
+local lastFail = false
+local joinClock = os.clock()
+
+bind(TeleportService.TeleportInitFailed, function(p)
+    if p == player then lastFail = true end
+end)
+
+local function queueScript()
+    local qot = queue_on_teleport or (syn and syn.queue_on_teleport)
+    if qot and SCRIPT_URL ~= "" then
+        pcall(qot, ('loadstring(game:HttpGet("%s"))()'):format(SCRIPT_URL))
+    end
+end
+
+local function shuffle(t)
+    for i = #t, 2, -1 do
+        local j = math.random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+end
+
+local HOSTS = { "games.roblox.com", "games.roproxy.com" }
+
+-- tries every host until one returns a valid server list
+local function fetchServers(order, cursor)
+    for _, host in ipairs(HOSTS) do
+        local url = ("https://%s/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100")
+            :format(host, game.PlaceId, order)
+        if cursor then url = url .. "&cursor=" .. cursor end
+        local body = httpGet(url)
+        if body then
+            local ok, res = pcall(function() return HttpService:JSONDecode(body) end)
+            if ok and type(res) == "table" and type(res.data) == "table" then return res end
+        end
+        task.wait(0.4)
+    end
+end
+
+-- no server list needed: Roblox picks the server itself
+local function randomTeleport()
+    lastFail = false
+    setHopStatus("Joining a random server...")
+    pcall(function() TeleportService:Teleport(game.PlaceId, player) end)
+    local t0 = os.clock()
+    while alive() and os.clock() - t0 < 10 and not lastFail do task.wait(0.25) end
+    return not lastFail
+end
+
+local function hop()
+    if hopping then return end
+    hopping = true
+    task.spawn(function()
+        queueScript()
+        local mode = cfg.hopMode or "Auto"
+        local done = false
+
+        if mode ~= "Random only" then
+            setHopStatus("Searching for a fresh server...")
+            local order = (math.random(2) == 1) and "Asc" or "Desc"
+            local cursor, pages = nil, 0
+            while alive() and not done and pages < 5 do
+                pages = pages + 1
+                local res = fetchServers(order, cursor)
+                if not res then
+                    setHopStatus("Server list failed on all hosts.")
+                    break
+                end
+                local cand = {}
+                for _, s in ipairs(res.data) do
+                    if s.id ~= game.JobId and s.playing and s.maxPlayers
+                        and s.playing < s.maxPlayers - 1 and not isRecent(s.id) then
+                        cand[#cand + 1] = s
+                    end
+                end
+                shuffle(cand)
+                for _, s in ipairs(cand) do
+                    if not alive() then break end
+                    markVisited(s.id)
+                    lastFail = false
+                    setHopStatus(("Joining %s... (%d players)"):format(string.sub(s.id, 1, 8), s.playing))
+                    pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, player) end)
+                    local t0 = os.clock()
+                    while alive() and os.clock() - t0 < 10 and not lastFail do task.wait(0.25) end
+                    if not lastFail then done = true break end
+                end
+                cursor = res.nextPageCursor
+                if not cursor then break end
+                task.wait(0.5)
+            end
+        end
+
+        if not done and alive() and mode ~= "List only" then
+            done = randomTeleport()
+        end
+
+        if done then
+            task.wait(15)
+        else
+            setHopStatus("Hop failed. Try again or change Hop Method.")
+        end
+        hopping = false
+    end)
+end
+
+markVisited(game.JobId) -- save the server we are in
+
+task.spawn(function()
+    local notified = false
+    while alive() do
+        task.wait(2)
+        if cfg.autoHop and not hopping and S.scanned and os.clock() - joinClock >= (tonumber(cfg.scanWait) or 6) then
+            if S.bestGen > 0 and S.bestGen >= minVal() then
+                if not notified then
+                    notified = true
+                    setHopStatus("Found $" .. fmt(S.bestGen) .. "/s - staying here.")
+                end
+            else
+                notified = false
+                hop()
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------------ GUI
+local IS_TOUCH = UserInputService.TouchEnabled
+local NO_KB = IS_TOUCH and not UserInputService.KeyboardEnabled -- phone / tablet without keyboard
+
+local MAX_W, MAX_H = 720, 500
+local MIN_W, MIN_H = 300, 260
+local SIDE_FULL, SIDE_COMPACT = 160, 58
+local HEADER_H, FOOTER_H = 66, 32
+local FAB_SIZE = IS_TOUCH and 58 or 50
+local ROW_H = IS_TOUCH and 56 or 50
+local ROW_SUB_H = IS_TOUCH and 70 or 64
+local TAB_H = IS_TOUCH and 48 or 42
+local SLIDER_H = IS_TOUCH and 74 or 68
+local DRAG_THRESHOLD = IS_TOUCH and 10 or 6
+local COMPACT_BELOW = 580
+
+local C = {
+    bg = Color3.fromRGB(16, 16, 22),
+    side = Color3.fromRGB(12, 12, 17),
+    card = Color3.fromRGB(26, 26, 34),
+    field = Color3.fromRGB(36, 36, 47),
+    line = Color3.fromRGB(46, 46, 60),
+    accent = Color3.fromRGB(235, 70, 90),
+    text = Color3.fromRGB(240, 240, 246),
+    sub = Color3.fromRGB(165, 165, 180),
+    dim = Color3.fromRGB(120, 120, 135),
+}
+local FAB_IDLE = Color3.fromRGB(22, 22, 25)
+local FAB_HOVER = Color3.fromRGB(40, 20, 20)
+local FAB_OPEN = Color3.fromRGB(200, 50, 50)
+
+local function new(class, props, parent)
+    local i = Instance.new(class)
+    for k, v in pairs(props or {}) do i[k] = v end
+    if parent then i.Parent = parent end
+    return i
+end
+local function corner(p, r) return new("UICorner", { CornerRadius = UDim.new(0, r) }, p) end
+local function stroke(p, color, th, tr)
+    return new("UIStroke", { Color = color, Thickness = th or 1, Transparency = tr or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, p)
+end
+local function tween(o, t, props, style, dir)
+    local tw = TweenService:Create(o, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
+    tw:Play()
+    return tw
+end
+local function validPos(t, dx, dy)
+    if type(t) == "table" and type(t[1]) == "number" and type(t[2]) == "number" then
+        return math.clamp(t[1], 0, 1), math.clamp(t[2], 0, 1)
+    end
+    return dx, dy
+end
+local function clampN(x, lo, hi)
+    if lo > hi then return (lo + hi) / 2 end
+    return math.max(lo, math.min(hi, x))
+end
+local function hairline(parent, pos, size)
+    return new("Frame", {
+        Position = pos, Size = size, BackgroundColor3 = C.line, BorderSizePixel = 0,
+    }, parent)
+end
+
+local gui = new("ScreenGui", { Name = "BRNT_GUI", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999 })
+pcall(function() gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets end) -- keep clear of notches
+do
+    local ok = pcall(function() gui.Parent = (gethui and gethui()) or CoreGui end)
+    if not ok or not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
+end
+
+local open = false
+local capture = nil -- key-capture callback (Settings > Menu Key)
+local compact = false -- narrow screen: icon-only sidebar
+local layoutHooks = {} -- functions re-run whenever the layout changes
+local W = {} -- layout refs
+
+local winX, winY = validPos(cfg.winPos, 0.5, 0.5)
+local fabX, fabY = validPos(cfg.fabPos, 0.05, 0.5)
+
+---------------------------------------------------------------- toast
+local toast
+local function notify(text, force)
+    if not cfg.notify and not force then return end
+    if toast then toast:Destroy() end
+    local w = math.clamp(gui.AbsoluteSize.X - 24, 220, 440)
+    local f = new("Frame", {
+        AnchorPoint = Vector2.new(0.5, 1), Size = UDim2.new(0, w, 0, 52), Position = UDim2.new(0.5, 0, 1, 80),
+        BackgroundColor3 = C.bg, BorderSizePixel = 0, ZIndex = 20,
+    }, gui)
+    corner(f, 8)
+    stroke(f, C.line, 1, 0)
+    new("TextLabel", {
+        Text = text, Font = F.med, TextSize = 16, TextColor3 = C.text, BackgroundTransparency = 1,
+        Size = UDim2.new(1, -28, 1, 0), Position = UDim2.new(0, 14, 0, 0), TextWrapped = true, ZIndex = 21,
+    }, f)
+    toast = f
+    tween(f, 0.25, { Position = UDim2.new(0.5, 0, 1, -20) })
+    task.delay(3.2, function()
+        if f.Parent then
+            local tw = tween(f, 0.2, { Position = UDim2.new(0.5, 0, 1, 80) })
+            tw.Completed:Connect(function() f:Destroy() end)
+        end
+    end)
+end
+
+---------------------------------------------------------------- main window
+local main = new("CanvasGroup", {
+    Name = "Main", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(winX, 0, winY, 0),
+    Size = UDim2.fromOffset(MAX_W, MAX_H), BackgroundTransparency = 1, BorderSizePixel = 0,
+    GroupTransparency = 1, Visible = false,
+}, gui)
+corner(main, 10)
+stroke(main, C.line, 1, 0)
+local scale = new("UIScale", { Scale = 1 }, main)
+
+-- background: dark with a soft magenta glow rising from the bottom
+local bgFrame = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, main)
+new("UIGradient", {
+    Rotation = 90,
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, C.bg),
+        ColorSequenceKeypoint.new(0.55, C.bg),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(62, 14, 34)),
+    }),
+}, bgFrame)
+
+local function baseScale() return math.clamp(tonumber(cfg.menuScale) or 1, 0.6, 1.3) end
+local function alphaGoal() return math.clamp(tonumber(cfg.menuAlpha) or 0, 0, 0.6) end
+
+-- sidebar backdrop + divider
+W.sideBg = new("Frame", {
+    Size = UDim2.new(0, SIDE_FULL, 1, 0), BackgroundColor3 = C.side, BackgroundTransparency = 0.3, BorderSizePixel = 0,
+}, main)
+W.divider = hairline(main, UDim2.new(0, SIDE_FULL, 0, 0), UDim2.new(0, 1, 1, 0))
+
+-- logo (plain text)
+W.logo = new("Frame", { Size = UDim2.new(0, SIDE_FULL, 0, HEADER_H), BackgroundTransparency = 1 }, main)
+W.logoName = new("TextLabel", {
+    Text = "BrainFind", Font = F.heavy, TextSize = 21, TextColor3 = C.text, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 18, 0, 11), Size = UDim2.new(1, -22, 0, 26), TextXAlignment = Enum.TextXAlignment.Left,
+}, W.logo)
+W.logoVer = new("TextLabel", {
+    Text = "v14", Font = F.reg, TextSize = 14, TextColor3 = C.dim, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 18, 0, 37), Size = UDim2.new(1, -22, 0, 18), TextXAlignment = Enum.TextXAlignment.Left,
+}, W.logo)
+W.logoShort = new("TextLabel", {
+    Text = "BF", Font = F.heavy, TextSize = 20, TextColor3 = C.text, BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 1, 0), Visible = false,
+}, W.logo)
+
+-- sidebar tab list
+W.sidebar = new("Frame", {
+    Position = UDim2.new(0, 0, 0, HEADER_H), Size = UDim2.new(0, SIDE_FULL, 1, -HEADER_H),
+    BackgroundTransparency = 1,
+}, main)
+new("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, W.sidebar)
+
+-- right side: header / content / footer
+W.right = new("Frame", {
+    Position = UDim2.new(0, SIDE_FULL + 1, 0, 0), Size = UDim2.new(1, -(SIDE_FULL + 1), 1, 0), BackgroundTransparency = 1,
+}, main)
+
+W.header = new("Frame", { Size = UDim2.new(1, 0, 0, HEADER_H), BackgroundTransparency = 1 }, W.right)
+W.headTitle = new("TextLabel", {
+    Font = F.bold, TextSize = 24, TextColor3 = C.text, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 18, 0, 9), Size = UDim2.new(1, -76, 0, 30), TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd, Text = "",
+}, W.header)
+W.headDesc = new("TextLabel", {
+    Font = F.reg, TextSize = 15, TextColor3 = C.sub, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 18, 0, 39), Size = UDim2.new(1, -76, 0, 20), TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd, Text = "",
+}, W.header)
+hairline(W.header, UDim2.new(0, 0, 1, -1), UDim2.new(1, 0, 0, 1))
+
+local CLOSE_SIZE = IS_TOUCH and 42 or 34
+W.closeBtn = new("TextButton", {
+    Text = "X", Font = F.bold, TextSize = 18, TextColor3 = C.sub, AutoButtonColor = false,
+    BackgroundTransparency = 1, Size = UDim2.new(0, CLOSE_SIZE, 0, CLOSE_SIZE),
+    Position = UDim2.new(1, -(CLOSE_SIZE + 8), 0, (HEADER_H - CLOSE_SIZE) / 2),
+}, W.header)
+W.closeBtn.MouseEnter:Connect(function() tween(W.closeBtn, 0.12, { TextColor3 = C.accent }) end)
+W.closeBtn.MouseLeave:Connect(function() tween(W.closeBtn, 0.12, { TextColor3 = C.sub }) end)
+
+W.content = new("Frame", {
+    Position = UDim2.new(0, 0, 0, HEADER_H), Size = UDim2.new(1, 0, 1, -(HEADER_H + FOOTER_H)),
+    BackgroundTransparency = 1, ClipsDescendants = true,
+}, W.right)
+
+W.footer = new("Frame", { Position = UDim2.new(0, 0, 1, -FOOTER_H), Size = UDim2.new(1, 0, 0, FOOTER_H), BackgroundTransparency = 1 }, W.right)
+hairline(W.footer, UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 1))
+W.footerL = new("TextLabel", {
+    Text = "", Font = F.reg, TextSize = 14, TextColor3 = C.sub, BackgroundTransparency = 1,
+    Position = UDim2.new(0, 18, 0, 0), Size = UDim2.new(0.7, -18, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, W.footer)
+W.footerR = new("TextLabel", {
+    Text = "", Font = F.reg, TextSize = 14, TextColor3 = C.dim, BackgroundTransparency = 1,
+    Position = UDim2.new(0.7, 0, 0, 0), Size = UDim2.new(0.3, -18, 1, 0), TextXAlignment = Enum.TextXAlignment.Right,
+}, W.footer)
+local function updateHint() W.footerR.Text = NO_KB and "" or ("Key: " .. tostring(cfg.menuKey)) end
+updateHint()
+
+---------------------------------------------------------------- tabs
+local orderN = 0
+local function nextOrder() orderN = orderN + 1 return orderN end
+
+local selectTab
+local tabs, tabOrder = {}, {}
+
+local function newPage()
+    local sf = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = IS_TOUCH and 4 or 3, ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false,
+    }, W.content)
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+    new("UIPadding", {
+        PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18),
+        PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 14),
+    }, sf)
+    return sf
+end
+
+-- tabs are plain text: no boxes, no icon squares. Active = bright text + thin accent bar.
+local function addTab(name, title, desc, glyph)
+    local page = newPage()
+    local btn = new("TextButton", {
+        Text = "", AutoButtonColor = false, Size = UDim2.new(1, 0, 0, TAB_H),
+        BackgroundTransparency = 1, LayoutOrder = #tabOrder + 1,
+    }, W.sidebar)
+    local bar = new("Frame", {
+        Size = UDim2.new(0, 3, 0, 20), Position = UDim2.new(0, 0, 0.5, -10),
+        BackgroundColor3 = C.accent, BackgroundTransparency = 1, BorderSizePixel = 0,
+    }, btn)
+    local lbl = new("TextLabel", {
+        Text = name, Font = F.bold, TextSize = 17, TextColor3 = C.sub, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 18, 0, 0), Size = UDim2.new(1, -18, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, btn)
+    local glyphLbl = new("TextLabel", {
+        Text = glyph or string.sub(name, 1, 1), Font = F.heavy, TextSize = 19, TextColor3 = C.sub,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0), Visible = false,
+    }, btn)
+    local t = { btn = btn, bar = bar, lbl = lbl, glyph = glyphLbl, page = page, title = title, desc = desc, active = false }
+    tabs[name] = t
+    table.insert(tabOrder, name)
+    btn.MouseEnter:Connect(function()
+        if not t.active then tween(lbl, 0.12, { TextColor3 = C.text }) tween(glyphLbl, 0.12, { TextColor3 = C.text }) end
+    end)
+    btn.MouseLeave:Connect(function()
+        if not t.active then tween(lbl, 0.12, { TextColor3 = C.sub }) tween(glyphLbl, 0.12, { TextColor3 = C.sub }) end
+    end)
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+    return page
+end
+
+selectTab = function(name)
+    for n, t in pairs(tabs) do
+        local on = (n == name)
+        t.active = on
+        if on and not t.page.Visible then t.page.CanvasPosition = Vector2.new(0, 0) end
+        t.page.Visible = on
+        tween(t.bar, 0.15, { BackgroundTransparency = on and 0 or 1 })
+        tween(t.lbl, 0.15, { TextColor3 = on and C.text or C.sub })
+        tween(t.glyph, 0.15, { TextColor3 = on and C.text or C.sub })
+        if on then W.headTitle.Text = t.title W.headDesc.Text = t.desc end
+    end
+end
+
+---------------------------------------------------------------- responsive layout
+local function relayout()
+    local v = gui.AbsoluteSize
+    if v.X <= 0 or v.Y <= 0 then return end
+    local sc = baseScale()
+    local winW = math.clamp(math.floor(v.X / sc) - 20, MIN_W, MAX_W)
+    local winH = math.clamp(math.floor(v.Y / sc) - 20, MIN_H, MAX_H)
+    compact = winW < COMPACT_BELOW
+    local sw = compact and SIDE_COMPACT or SIDE_FULL
+
+    main.Size = UDim2.fromOffset(winW, winH)
+    W.sideBg.Size = UDim2.new(0, sw, 1, 0)
+    W.divider.Position = UDim2.new(0, sw, 0, 0)
+    W.logo.Size = UDim2.new(0, sw, 0, HEADER_H)
+    W.logoName.Visible = not compact
+    W.logoVer.Visible = not compact
+    W.logoShort.Visible = compact
+    W.sidebar.Size = UDim2.new(0, sw, 1, -HEADER_H)
+    W.right.Position = UDim2.new(0, sw + 1, 0, 0)
+    W.right.Size = UDim2.new(1, -(sw + 1), 1, 0)
+
+    local hideHint = compact or NO_KB
+    W.footerR.Visible = not hideHint
+    W.footerL.Size = hideHint and UDim2.new(1, -36, 1, 0) or UDim2.new(0.7, -18, 1, 0)
+
+    for _, t in pairs(tabs) do
+        t.lbl.Visible = not compact
+        t.glyph.Visible = compact
+    end
+    for _, f in ipairs(layoutHooks) do pcall(f) end
+
+    -- keep the window fully on screen after a resize / rotation
+    local hw, hh = winW * sc / 2, winH * sc / 2
+    local cx = clampN(main.Position.X.Scale * v.X + main.Position.X.Offset, hw + 6, v.X - hw - 6)
+    local cy = clampN(main.Position.Y.Scale * v.Y + main.Position.Y.Offset, hh + 6, v.Y - hh - 6)
+    main.Position = UDim2.new(cx / v.X, 0, cy / v.Y, 0)
+end
+gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    relayout()
+    if open then scale.Scale = baseScale() end
+end)
+relayout()
+
+---------------------------------------------------------------- row components
+-- Rows are rounded cards with a soft outline, tint on hover.
+-- returns row, titleLabel, subLabel.  `reserve` = pixels kept free on the right for the control
+local function makeRow(parent, text, h, sub, reserve)
+    h = h or (sub and ROW_SUB_H or ROW_H)
+    reserve = reserve or 14
+    local r = new("Frame", { Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = C.card, BorderSizePixel = 0 }, parent)
+    corner(r, 8)
+    stroke(r, C.line, 1, 0.4)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, r)
+    local titleH = sub and 26 or (h > ROW_H and 40 or h)
+    local title = new("TextLabel", {
+        Text = text, Font = F.med, TextSize = 18, TextColor3 = C.text, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 2, 0, sub and (IS_TOUCH and 9 or 7) or 0), Size = UDim2.new(1, -(2 + reserve), 0, titleH),
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, r)
+    local subLbl
+    if sub then
+        subLbl = new("TextLabel", {
+            Text = sub, Font = F.reg, TextSize = 14, TextColor3 = C.dim, BackgroundTransparency = 1,
+            Position = UDim2.new(0, 2, 0, IS_TOUCH and 37 or 34), Size = UDim2.new(1, -(2 + reserve), 0, 20),
+            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+        }, r)
+    end
+    return r, title, subLbl
+end
+
+local function hover(row, hit)
+    hit.MouseEnter:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.field }) end)
+    hit.MouseLeave:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.card }) end)
+end
+
+local UI = {}
+
+function UI.toggle(page, text, default, cb, sub)
+    local row = makeRow(page, text, nil, sub, 68)
+    row.LayoutOrder = nextOrder()
+    local track = new("Frame", { Size = UDim2.new(0, 46, 0, 26), Position = UDim2.new(1, -48, 0.5, -13), BackgroundColor3 = C.field, BorderSizePixel = 0 }, row)
+    corner(track, 13)
+    local knob = new("Frame", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(0, 3, 0.5, -10), BackgroundColor3 = C.sub, BorderSizePixel = 0 }, track)
+    corner(knob, 10)
+    local hit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, row)
+    local state = default and true or false
+    local function render(anim)
+        local goalK = { Position = state and UDim2.new(1, -23, 0.5, -10) or UDim2.new(0, 3, 0.5, -10),
+            BackgroundColor3 = state and C.text or C.sub }
+        local goalT = { BackgroundColor3 = state and C.accent or C.field }
+        if anim then tween(knob, 0.15, goalK) tween(track, 0.15, goalT)
+        else for k, v in pairs(goalK) do knob[k] = v end for k, v in pairs(goalT) do track[k] = v end end
+    end
+    render(false)
+    hover(row, hit)
+    hit.MouseButton1Click:Connect(function()
+        state = not state
+        render(true)
+        if cb then cb(state) end
+    end)
+    return { Set = function(v) state = v and true or false render(true) end }
+end
+
+function UI.input(page, text, default, placeholder, cb, sub)
+    local row, title, subLbl = makeRow(page, text, nil, sub, 150)
+    row.LayoutOrder = nextOrder()
+    local box = new("TextBox", {
+        BackgroundColor3 = C.field, Text = tostring(default or ""), PlaceholderText = placeholder or "",
+        PlaceholderColor3 = C.dim, TextColor3 = C.text,
+        Font = F.med, TextSize = 17, ClearTextOnFocus = false,
+    }, row)
+    corner(box, 6)
+    local boxStroke = stroke(box, C.line, 1, 0)
+    local function fit()
+        local w, h = compact and 104 or 132, IS_TOUCH and 38 or 32
+        box.Size = UDim2.new(0, w, 0, h)
+        box.Position = UDim2.new(1, -w, 0.5, -h / 2)
+        title.Size = UDim2.new(1, -(2 + w + 12), 0, title.Size.Y.Offset)
+        if subLbl then subLbl.Size = UDim2.new(1, -(2 + w + 12), 0, 20) end
+    end
+    fit()
+    table.insert(layoutHooks, fit)
+    box.Focused:Connect(function() tween(boxStroke, 0.12, { Color = C.accent }) end)
+    box.FocusLost:Connect(function()
+        tween(boxStroke, 0.12, { Color = C.line })
+        if cb then cb(box.Text, box) end
+    end)
+    return box
+end
+
+function UI.button(page, text, hint, cb)
+    local row = makeRow(page, text, nil, nil, 14)
+    row.LayoutOrder = nextOrder()
+    local title = row:FindFirstChildOfClass("TextLabel")
+    title.Size = UDim2.new(0.55, -2, 1, 0)
+    new("TextLabel", {
+        Text = hint or "tap", Font = F.reg, TextSize = 15, TextColor3 = C.dim,
+        BackgroundTransparency = 1, Position = UDim2.new(0.55, 0, 0, 0), Size = UDim2.new(0.45, 0, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+    local hit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, row)
+    hover(row, hit)
+    hit.MouseButton1Click:Connect(function()
+        row.BackgroundColor3 = C.accent
+        tween(row, 0.3, { BackgroundColor3 = C.card })
+        if cb then cb() end
+    end)
+end
+
+function UI.label(page, text)
+    local l = new("TextLabel", {
+        Text = text, Font = F.reg, TextSize = 14, TextColor3 = C.dim,
+        BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), AutomaticSize = Enum.AutomaticSize.Y,
+        TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+    }, page)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 2) }, l)
+    return l
+end
+
+-- status card: wraps up to a few lines (use .Text like a label)
+function UI.status(page, text)
+    local f = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder() }, page)
+    corner(f, 8) stroke(f, C.line, 1, 0.4)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, f)
+    return new("TextLabel", {
+        Text = text, Font = F.med, TextSize = 15, TextColor3 = C.sub, BackgroundTransparency = 1,
+        Size = UDim2.new(1, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, f)
+end
+
+-- stat card: returns a list of value labels
+function UI.stats(page, captions)
+    local card = new("Frame", { Size = UDim2.new(1, 0, 0, 80), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder() }, page)
+    corner(card, 8) stroke(card, C.line, 1, 0.4)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, card)
+    local n, vals = #captions, {}
+    for i, cap in ipairs(captions) do
+        local tile = new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1 / n, 0, 1, 0), Position = UDim2.new((i - 1) / n, 0, 0, 0) }, card)
+        new("TextLabel", { Text = cap, Font = F.bold, TextSize = 13, TextColor3 = C.dim, BackgroundTransparency = 1,
+            Position = UDim2.new(0, 2, 0, 10), Size = UDim2.new(1, -2, 0, 18), TextXAlignment = Enum.TextXAlignment.Left }, tile)
+        local v = new("TextLabel", { Text = "-", Font = F.heavy, TextSize = 26, TextColor3 = C.text, BackgroundTransparency = 1,
+            Position = UDim2.new(0, 2, 0, 32), Size = UDim2.new(1, -8, 0, 34), TextScaled = true, TextXAlignment = Enum.TextXAlignment.Left }, tile)
+        new("UITextSizeConstraint", { MaxTextSize = 26, MinTextSize = 12 }, v)
+        vals[i] = v
+    end
+    return vals
+end
+
+function UI.section(page, text)
+    local f = new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, page)
+    new("Frame", { Size = UDim2.new(0, 3, 0, 14), Position = UDim2.new(0, 2, 0, 16), BackgroundColor3 = C.accent, BorderSizePixel = 0 }, f)
+    new("TextLabel", {
+        Text = string.upper(text), Font = F.heavy, TextSize = 14, TextColor3 = C.text, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 12, 0, 13), Size = UDim2.new(1, -12, 0, 20), TextXAlignment = Enum.TextXAlignment.Left,
+    }, f)
+end
+
+function UI.keybind(page, text, default, cb)
+    local row, title = makeRow(page, text, nil, nil, 150)
+    row.LayoutOrder = nextOrder()
+    local btn = new("TextButton", {
+        Text = tostring(default), Font = F.med, TextSize = 17, TextColor3 = C.text, AutoButtonColor = false,
+        BackgroundColor3 = C.field,
+    }, row)
+    corner(btn, 6)
+    local btnStroke = stroke(btn, C.line, 1, 0)
+    local function fit()
+        local w, h = compact and 104 or 132, 32
+        btn.Size = UDim2.new(0, w, 0, h)
+        btn.Position = UDim2.new(1, -w, 0.5, -h / 2)
+        title.Size = UDim2.new(1, -(2 + w + 12), 1, 0)
+    end
+    fit()
+    table.insert(layoutHooks, fit)
+    btn.MouseButton1Click:Connect(function()
+        btn.Text = "Press a key..."
+        tween(btnStroke, 0.12, { Color = C.accent })
+        capture = function(input)
+            tween(btnStroke, 0.12, { Color = C.line })
+            if input.KeyCode == Enum.KeyCode.Escape or input.KeyCode == Enum.KeyCode.Unknown then
+                btn.Text = tostring(cfg.menuKey)
+                return
+            end
+            btn.Text = input.KeyCode.Name
+            if cb then cb(input.KeyCode.Name) end
+        end
+    end)
+    return btn
+end
+
+-- slider: applies on release; page scrolling is locked while dragging (touch-friendly)
+function UI.slider(page, text, min, max, default, decimals, cb)
+    local row = makeRow(page, text, SLIDER_H)
+    row.LayoutOrder = nextOrder()
+    local valLbl = new("TextLabel", {
+        Font = F.med, TextSize = 17, TextColor3 = C.sub, BackgroundTransparency = 1,
+        Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, 0, 0, 40),
+        TextXAlignment = Enum.TextXAlignment.Right, Text = "",
+    }, row)
+    local track = new("Frame", {
+        Position = UDim2.new(0, 2, 1, -20), Size = UDim2.new(1, -4, 0, 5), BackgroundColor3 = C.field, BorderSizePixel = 0,
+    }, row)
+    corner(track, 3)
+    local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = C.accent, BorderSizePixel = 0 }, track)
+    corner(fill, 3)
+    local knob = new("Frame", {
+        Size = UDim2.new(0, IS_TOUCH and 20 or 14, 0, IS_TOUCH and 20 or 14), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = C.text, BorderSizePixel = 0, ZIndex = 2,
+    }, track)
+    corner(knob, 10)
+    local hitH = IS_TOUCH and 44 or 28
+    local hit = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, hitH), Position = UDim2.new(0, 0, 0.5, -hitH / 2), BackgroundTransparency = 1, Text = "",
+    }, track)
+
+    local value = math.clamp(tonumber(default) or min, min, max)
+    local mult = 10 ^ decimals
+    local function render()
+        local a = (value - min) / (max - min)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
+        valLbl.Text = string.format("%." .. decimals .. "f", value)
+    end
+    render()
+
+    local dragging, activeInput = false, nil
+    local function setX(x)
+        local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+        value = math.floor((min + (max - min) * a) * mult + 0.5) / mult
+        render()
+    end
+    hit.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, activeInput = true, i
+            page.ScrollingEnabled = false
+            setX(i.Position.X)
+        end
+    end)
+    bind(UserInputService.InputChanged, function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i == activeInput) then
+            setX(i.Position.X)
+        end
+    end)
+    bind(UserInputService.InputEnded, function(i)
+        if dragging and (i == activeInput or i.UserInputType == Enum.UserInputType.MouseButton1) then
+            dragging = false
+            page.ScrollingEnabled = true
+            if cb then cb(value) end
+        end
+    end)
+    return { Set = function(v) value = math.clamp(v, min, max) render() end }
+end
+
+function UI.dropdown(page, text, options, default, cb, placeholder)
+    local container = new("Frame", {
+        Size = UDim2.new(1, 0, 0, ROW_H), BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = nextOrder(),
+    }, page)
+    new("UIListLayout", { Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder }, container)
+    local row = makeRow(container, text)
+    row.LayoutOrder = 1
+    local valLbl = new("TextLabel", {
+        Text = tostring(default), Font = F.med, TextSize = 16,
+        TextColor3 = C.sub, BackgroundTransparency = 1,
+        Position = UDim2.new(0.4, 0, 0, 0), Size = UDim2.new(0.6, 0, 1, 0),
+        TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+    local rowHit = new("TextButton", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "" }, row)
+    local holder = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Visible = false, LayoutOrder = 2 }, container)
+    new("UIListLayout", { Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder }, holder)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12) }, holder)
+
+    local selected = { label = tostring(default), value = (not placeholder) and default or nil }
+    local obj = {}
+    function obj.setOptions(opts)
+        for _, c in ipairs(holder:GetChildren()) do
+            if c:IsA("GuiObject") then c:Destroy() end
+        end
+        if #opts == 0 then
+            new("TextLabel", { Text = "(nothing here yet)", Font = F.reg, TextSize = 15, TextColor3 = C.dim,
+                BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 36), TextXAlignment = Enum.TextXAlignment.Left }, holder)
+        end
+        for i, o in ipairs(opts) do
+            local lbl = type(o) == "table" and o.label or tostring(o)
+            local val = type(o) == "table" and o.value or o
+            local b = new("TextButton", {
+                Text = lbl, Font = F.reg, TextSize = 16, TextColor3 = C.sub,
+                BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, AutoButtonColor = false,
+                Size = UDim2.new(1, 0, 0, IS_TOUCH and 42 or 36), TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = i,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, holder)
+            new("UIPadding", { PaddingLeft = UDim.new(0, 8) }, b)
+            b.MouseEnter:Connect(function() tween(b, 0.1, { BackgroundTransparency = 0.94, TextColor3 = C.text }) end)
+            b.MouseLeave:Connect(function() tween(b, 0.1, { BackgroundTransparency = 1, TextColor3 = C.sub }) end)
+            b.MouseButton1Click:Connect(function()
+                selected = { label = lbl, value = val }
+                valLbl.Text = lbl
+                holder.Visible = false
+                if cb then cb(val, lbl) end
+            end)
+        end
+    end
+    function obj.get() return selected.value end
+    obj.setOptions(options)
+    hover(row, rowHit)
+    rowHit.MouseButton1Click:Connect(function() holder.Visible = not holder.Visible end)
+    return obj
+end
+
+---------------------------------------------------------------- open / close
+local fab, fabStroke
+local function fabColor() return open and FAB_OPEN or FAB_IDLE end
+
+local function setOpen(v)
+    if v == open then return end
+    open = v
+    if fab then tween(fab, 0.2, { BackgroundColor3 = fabColor() }) end
+    local target = baseScale()
+    if v then
+        relayout()
+        main.Visible = true
+        if cfg.anim then
+            scale.Scale = target * 0.95
+            main.GroupTransparency = 1
+            tween(main, 0.18, { GroupTransparency = alphaGoal() })
+            tween(scale, 0.18, { Scale = target })
+        else
+            scale.Scale = target
+            main.GroupTransparency = alphaGoal()
+        end
+    else
+        if cfg.anim then
+            local tw = tween(main, 0.14, { GroupTransparency = 1 })
+            tween(scale, 0.14, { Scale = target * 0.96 })
+            tw.Completed:Connect(function() if not open then main.Visible = false end end)
+        else
+            main.GroupTransparency = 1
+            main.Visible = false
+        end
+    end
+end
+
+---------------------------------------------------------------- pages
+-- Brainrots
+local minBoxes = {}
+local function applyMin(txt, box)
+    local v = parseValue(txt)
+    if v then
+        cfg.minValue = txt saveCfg()
+        for _, b in ipairs(minBoxes) do b.Text = tostring(cfg.minValue) end
+        notify("Min value set to $" .. fmt(v) .. "/s")
+        pcall(scanBrainrots)
+    else
+        box.Text = tostring(cfg.minValue)
+        notify("Invalid value. Use numbers like 500k, 1m, 2.5b")
+    end
+end
+
+local pBrain = addTab("Brainrots", "Brainrot ESP", "Highlight the most valuable brainrot on any base.", "B")
+local brainStats = UI.stats(pBrain, { "BEST", "OTHERS", "MY BASE" })
+local brainStatus = UI.status(pBrain, "Scanning...")
+
+UI.section(pBrain, "Top finds")
+local topCard = new("Frame", { Size = UDim2.new(1, 0, 0, 5 * 26 + 16), BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = nextOrder() }, pBrain)
+corner(topCard, 8) stroke(topCard, C.line, 1, 0.4)
+new("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 8) }, topCard)
+local topLabels = {}
+for i = 1, 5 do
+    topLabels[i] = new("TextLabel", {
+        Text = "", Font = F.med, TextSize = 16, TextColor3 = C.sub, BackgroundTransparency = 1,
+        Position = UDim2.new(0, 0, 0, (i - 1) * 26), Size = UDim2.new(1, 0, 0, 26),
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, topCard)
+end
+
+UI.section(pBrain, "ESP")
+UI.toggle(pBrain, "Brainrot ESP", cfg.brainEsp, function(v) cfg.brainEsp = v saveCfg() pcall(scanBrainrots) end, "Highlights the best brainrot")
+UI.toggle(pBrain, "Tracer Line", cfg.brainTracer, function(v) cfg.brainTracer = v saveCfg() end, "Line from you to the best one")
+UI.toggle(pBrain, "Highlight All >= Min", cfg.brainAll, function(v) cfg.brainAll = v saveCfg() pcall(scanBrainrots) end, "Cyan tags above the min value")
+table.insert(minBoxes, UI.input(pBrain, "Min Value", cfg.minValue, "e.g. 1m", applyMin, "500k, 1m, 2.5b"))
+UI.button(pBrain, "Rescan Now", "refresh", function() pcall(scanBrainrots) notify("Rescanned bases.") end)
+UI.button(pBrain, "Debug: Print Matches", "F9 console", function()
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then print("[BrainFind] no Plots folder") return end
+    for _, d in ipairs(plots:GetDescendants()) do
+        if d:IsA("TextLabel") and textGen(d.Text) then print(d:GetFullName(), "=", d.Text) end
+    end
+end)
+
+UI.section(pBrain, "My base")
+UI.toggle(pBrain, "Hide My Brainrots", cfg.hideOwn, function(v) cfg.hideOwn = v saveCfg() pcall(scanBrainrots) end, "Ignored by ESP, best and hop")
+UI.toggle(pBrain, "Mark My Base", cfg.markBase, function(v) cfg.markBase = v saveCfg() pcall(scanBrainrots) end, "Label over your plot")
+UI.button(pBrain, "Set Base = Nearest Plot", "stand in base", function()
+    local p = nearestPlot()
+    if p then
+        S.manualPlot = p
+        pcall(scanBrainrots)
+        notify("Base set to plot: " .. p.Name)
+    else
+        notify("Couldn't find a plot near you.")
+    end
+end)
+UI.button(pBrain, "Re-detect Base", "automatic", function()
+    S.manualPlot, S.guessPlot = nil, nil
+    pcall(scanBrainrots)
+    notify("Base: " .. S.baseWhy .. (S.myPlot and (" (" .. S.myPlot.Name .. ")") or ""))
+end)
+
+-- Players
+local pPlr = addTab("Players", "Player ESP", "See other players through walls.", "P")
+UI.toggle(pPlr, "Player ESP", cfg.plrEsp, function(v) cfg.plrEsp = v saveCfg() end, "Master switch")
+UI.section(pPlr, "Style")
+UI.toggle(pPlr, "Highlight", cfg.plrHighlight, function(v) cfg.plrHighlight = v saveCfg() end)
+UI.toggle(pPlr, "Names", cfg.plrNames, function(v) cfg.plrNames = v saveCfg() end)
+UI.toggle(pPlr, "Distance", cfg.plrDistance, function(v) cfg.plrDistance = v saveCfg() end)
+UI.toggle(pPlr, "Tracers", cfg.plrTracer, function(v) cfg.plrTracer = v saveCfg() end)
+UI.toggle(pPlr, "Hide Teammates", cfg.plrTeam, function(v) cfg.plrTeam = v saveCfg() end)
+UI.dropdown(pPlr, "Colour", { "Red", "Blue", "Green", "White", "Purple", "Orange" }, cfg.plrColor, function(v) cfg.plrColor = v saveCfg() end)
+
+-- Server hop
+local pHop = addTab("Server Hop", "Server Hop", "Hop until a brainrot worth your min value shows up.", "H")
+local hopStatus = UI.status(pHop, "Idle.")
+UI.toggle(pHop, "Auto Server Hop", cfg.autoHop, function(v)
+    cfg.autoHop = v saveCfg()
+    if v then
+        joinClock = os.clock()
+        if SCRIPT_URL == "" then notify("Tip: set SCRIPT_URL (top of script) or use autoexec so it keeps running after a hop.") end
+    end
+end, "Hops until the min value is found")
+UI.section(pHop, "Settings")
+table.insert(minBoxes, UI.input(pHop, "Min Value", cfg.minValue, "e.g. 1m", applyMin))
+UI.input(pHop, "Scan Wait (sec)", cfg.scanWait, "6", function(txt, box)
+    local n = tonumber(txt)
+    if n and n >= 1 then cfg.scanWait = n saveCfg() else box.Text = tostring(cfg.scanWait) end
+end)
+UI.input(pHop, "Skip Visited (min)", cfg.expireMin, "30", function(txt, box)
+    local n = tonumber(txt)
+    if n and n >= 0 then cfg.expireMin = n saveCfg() else box.Text = tostring(cfg.expireMin) end
+end)
+UI.dropdown(pHop, "Hop Method", { "Auto", "List only", "Random only" }, cfg.hopMode, function(v)
+    cfg.hopMode = v saveCfg()
+    notify("Hop method: " .. v)
+end)
+UI.button(pHop, "Hop Now", "random fresh server", function() hop() end)
+UI.section(pHop, "Saved servers")
+local savedDD = UI.dropdown(pHop, "Saved Job IDs", {}, "Select a server", function() end, true)
+UI.button(pHop, "Join Selected", "teleport", function()
+    local id = savedDD.get()
+    if type(id) ~= "string" or #id < 30 then notify("Select a saved server first.") return end
+    if id == game.JobId then notify("You're already in that server.") return end
+    queueScript()
+    notify("Joining " .. string.sub(id, 1, 8) .. "...")
+    pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, id, player) end)
+end)
+UI.button(pHop, "Copy Selected Job ID", "clipboard", function()
+    local id = savedDD.get()
+    if type(id) ~= "string" or #id < 30 then notify("Select a saved server first.") return end
+    notify(copy(id) and "Job ID copied." or "Clipboard not supported by your executor.")
+end)
+UI.button(pHop, "Copy Current Job ID", "clipboard", function()
+    notify(copy(game.JobId) and "Current Job ID copied." or "Clipboard not supported by your executor.")
+end)
+UI.button(pHop, "Clear Saved Servers", "wipe list", function()
+    visited = {}
+    markVisited(game.JobId)
+    notify("Saved servers cleared.")
+end)
+
+refreshSaved = function()
+    local opts = {}
+    for i = #visited, 1, -1 do
+        local e = visited[i]
+        if #opts >= 25 then break end
+        local val = e.best and ("$" .. fmt(e.best) .. "/s") or "not scanned"
+        local here = (e.id == game.JobId) and " (current)" or ""
+        opts[#opts + 1] = { label = string.sub(e.id, 1, 8) .. "  |  " .. val .. "  |  " .. ago(e.t) .. here, value = e.id }
+    end
+    savedDD.setOptions(opts)
+end
+refreshSaved()
+
+-- Settings
+local pSet = addTab("Settings", "Settings", "Menu, behaviour and script options.", "S")
+
+UI.section(pSet, "Menu")
+if not NO_KB then
+    UI.keybind(pSet, "Menu Key", cfg.menuKey, function(name)
+        cfg.menuKey = name saveCfg() updateHint()
+        notify("Menu key: " .. name)
+    end)
+    UI.toggle(pSet, "Show BF Button", cfg.showFab, function(v)
+        cfg.showFab = v saveCfg()
+        if fab then fab.Visible = v end
+        if not v then notify("BF button hidden. Press " .. tostring(cfg.menuKey) .. " to open/close.", true) end
+    end, "Floating open/close button")
+end
+UI.toggle(pSet, "Animations", cfg.anim, function(v) cfg.anim = v saveCfg() end)
+UI.toggle(pSet, "Open Menu On Load", cfg.openOnLoad, function(v) cfg.openOnLoad = v saveCfg() end)
+UI.toggle(pSet, "Lock Window Position", cfg.lockWin, function(v) cfg.lockWin = v saveCfg() end)
+UI.slider(pSet, "Menu Scale", 0.6, 1.3, cfg.menuScale, 2, function(v)
+    cfg.menuScale = v saveCfg()
+    relayout()
+    if open then tween(scale, 0.15, { Scale = baseScale() }) end
+end)
+UI.slider(pSet, "Menu Transparency", 0, 0.5, cfg.menuAlpha, 2, function(v)
+    cfg.menuAlpha = v saveCfg()
+    if open then tween(main, 0.15, { GroupTransparency = alphaGoal() }) end
+end)
+
+UI.section(pSet, "General")
+UI.toggle(pSet, "Notifications", cfg.notify, function(v) cfg.notify = v saveCfg() end)
+
+---------------------------------------------------------------- drag + input
+-- drag + click handler that works with mouse and touch
+local function makeDraggable(handle, target, opts)
+    opts = opts or {}
+    local dragging, moved, activeInput, startPt, startCenter = false, false, nil, nil, nil
+    handle.InputBegan:Connect(function(i)
+        if dragging then return end
+        if opts.canDrag and not opts.canDrag() then return end
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            local v = gui.AbsoluteSize
+            dragging, moved, activeInput = true, false, i
+            startPt = Vector2.new(i.Position.X, i.Position.Y)
+            startCenter = Vector2.new(
+                target.Position.X.Scale * v.X + target.Position.X.Offset,
+                target.Position.Y.Scale * v.Y + target.Position.Y.Offset)
+        end
+    end)
+    bind(UserInputService.InputChanged, function(i)
+        if not dragging then return end
+        if i.UserInputType == Enum.UserInputType.MouseMovement or i == activeInput then
+            local d = Vector2.new(i.Position.X, i.Position.Y) - startPt
+            if not moved and d.Magnitude > DRAG_THRESHOLD then moved = true end
+            if not moved then return end
+            local v = gui.AbsoluteSize
+            if v.X <= 0 or v.Y <= 0 then return end
+            local hw, hh = target.AbsoluteSize.X / 2, target.AbsoluteSize.Y / 2
+            local cx, cy = startCenter.X + d.X, startCenter.Y + d.Y
+            if opts.inside then
+                cx = clampN(cx, hw, v.X - hw)
+                cy = clampN(cy, hh, v.Y - hh)
+            else
+                -- the window may leave the screen a little, but the header stays reachable
+                cx = clampN(cx, 90 - hw, v.X - 90 + hw)
+                cy = clampN(cy, hh, v.Y - 50 + hh)
+            end
+            target.Position = UDim2.new(cx / v.X, 0, cy / v.Y, 0)
+        end
+    end)
+    bind(UserInputService.InputEnded, function(i)
+        if not dragging then return end
+        local t = activeInput and activeInput.UserInputType
+        local same = (i == activeInput)
+            or (t == Enum.UserInputType.MouseButton1 and i.UserInputType == Enum.UserInputType.MouseButton1)
+            or (t == Enum.UserInputType.Touch and i.UserInputType == Enum.UserInputType.Touch)
+        if not same then return end
+        dragging = false
+        if moved then
+            if opts.onEnd then opts.onEnd(target.Position.X.Scale, target.Position.Y.Scale) end
+        elseif opts.onClick then
+            opts.onClick()
+        end
+    end)
+end
+
+-- the logo + header area drags the window
+local function winDrag() return {
+    canDrag = function() return not cfg.lockWin end,
+    onEnd = function(x, y) cfg.winPos = { x, y } saveCfg() end,
+} end
+makeDraggable(W.header, main, winDrag())
+makeDraggable(W.logo, main, winDrag())
+W.closeBtn.MouseButton1Click:Connect(function() setOpen(false) end)
+
+-- floating button (always visible on phones): dark rounded square with an accent outline,
+-- fills solid while the menu is open
+fab = new("TextButton", {
+    Name = "Fab", Text = "BF", Font = F.heavy, TextSize = IS_TOUCH and 20 or 18, TextColor3 = C.text, AutoButtonColor = false,
+    BackgroundColor3 = fabColor(), AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(fabX, 0, fabY, 0), Size = UDim2.new(0, FAB_SIZE, 0, FAB_SIZE), ZIndex = 10,
+    Visible = cfg.showFab or NO_KB,
+}, gui)
+corner(fab, 12)
+fabStroke = stroke(fab, C.accent, 1, 0)
+fab.MouseEnter:Connect(function() if not open then tween(fab, 0.12, { BackgroundColor3 = FAB_HOVER }) end end)
+fab.MouseLeave:Connect(function() tween(fab, 0.12, { BackgroundColor3 = fabColor() }) end)
+makeDraggable(fab, fab, {
+    inside = true,
+    onClick = function() setOpen(not open) end,
+    onEnd = function(x, y) cfg.fabPos = { x, y } saveCfg() end,
+})
+
+-- keyboard toggle (and key capture for rebinding)
+bind(UserInputService.InputBegan, function(input, gpe)
+    if capture and input.UserInputType == Enum.UserInputType.Keyboard then
+        local f = capture
+        capture = nil
+        f(input)
+        return
+    end
+    if gpe then return end
+    local ok, key = pcall(function() return Enum.KeyCode[cfg.menuKey] end)
+    if ok and key and input.KeyCode == key then setOpen(not open) end
+end)
+
+-- Settings (rest): needs setOpen / positions
+UI.section(pSet, "Reset")
+UI.button(pSet, "Reset Menu Positions", "window + BF button", function()
+    cfg.winPos = { 0.5, 0.5 }
+    cfg.fabPos = { 0.05, 0.5 }
+    saveCfg()
+    tween(main, 0.25, { Position = UDim2.new(0.5, 0, 0.5, 0) })
+    tween(fab, 0.25, { Position = UDim2.new(0.05, 0, 0.5, 0) })
+    notify("Positions reset.")
+end)
+UI.button(pSet, "Reset All Settings", "re-run script after", function()
+    for k in pairs(cfg) do cfg[k] = nil end
+    for k, v in pairs(defaults) do cfg[k] = v end
+    saveCfg()
+    notify("Settings reset. Re-execute the script to apply everything.", true)
+end)
+UI.button(pSet, "Unload Script", "removes everything", function()
+    genv.BRNT_TOKEN = (genv.BRNT_TOKEN or 0) + 1
+    for m in pairs(tags) do untag(m) end
+    for p in pairs(plrObjs) do destroyPlr(p) end
+    if baseTag then pcall(function() baseTag.bb:Destroy() end) end
+    for _, l in ipairs(allLines) do killLine(l) end
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    gui:Destroy()
+end)
+UI.label(pSet, canFile and "Settings and saved servers are stored in your executor workspace (BRNT_config.json, BRNT_servers.json)."
+    or "Your executor has no file functions, so settings and saved servers only last until you leave.")
+
+---------------------------------------------------------------- status updaters
+local ORANGE = Color3.fromRGB(255, 170, 60)
+setBrainStatus = function()
+    for i, l in ipairs(topLabels) do
+        local t = S.top and S.top[i]
+        l.Text = t and (i .. ".  " .. tostring(t.name) .. "   $" .. fmt(t.gen) .. "/s") or ""
+        l.TextColor3 = (i == 1) and GOLD or C.sub
+    end
+    brainStats[1].Text = S.bestGen > 0 and ("$" .. fmt(S.bestGen) .. "/s") or "-"
+    brainStats[1].TextColor3 = S.bestGen > 0 and GOLD or C.text
+    brainStats[2].Text = tostring(S.count)
+    if S.myPlot then
+        local found = (S.baseWhy == "detected" or S.baseWhy == "manual")
+        brainStats[3].Text = found and "Found" or "Guess"
+        brainStats[3].TextColor3 = found and GREEN or ORANGE
+    else
+        brainStats[3].Text = "?"
+        brainStats[3].TextColor3 = C.text
+    end
+    local line1 = S.bestName and ("Best: " .. S.bestName) or "No brainrots found on other bases yet."
+    local line2 = S.myPlot and (("Base: %s (%s)"):format(S.myPlot.Name, S.baseWhy)) or ("Base: " .. S.baseWhy)
+    brainStatus.Text = line1 .. "\n" .. line2
+end
+setHopStatus = function(t)
+    if t then hopStatus.Text = t return end
+end
+task.spawn(function()
+    while alive() do
+        if not hopping and not (cfg.autoHop and S.bestGen >= minVal() and S.bestGen > 0) then
+            local best = S.bestGen > 0 and ("Best here: $" .. fmt(S.bestGen) .. "/s") or "No brainrot detected"
+            hopStatus.Text = best .. "\nMin: $" .. fmt(minVal()) .. "/s  |  Auto hop: " .. (cfg.autoHop and "ON" or "OFF")
+        end
+        local bestTxt = S.bestGen > 0 and ("Best: $" .. fmt(S.bestGen) .. "/s") or "Best: -"
+        local baseTxt = S.myPlot and ((S.baseWhy == "detected" or S.baseWhy == "manual") and "Base: OK" or "Base: guess") or "Base: ?"
+        W.footerL.Text = bestTxt .. "  |  Hop: " .. (cfg.autoHop and "ON" or "OFF")
+            .. "  |  ESP: " .. ((cfg.brainEsp or cfg.plrEsp) and "ON" or "OFF")
+            .. "  |  " .. baseTxt
+        task.wait(1)
+    end
+end)
+
+selectTab("Brainrots")
+relayout()
+if cfg.openOnLoad then setOpen(true) end
+notify("BrainFind loaded. " .. (NO_KB and "Tap BF to open/close."
+    or ("Press " .. tostring(cfg.menuKey) .. (cfg.showFab and " or tap BF" or "") .. " to open/close.")))
+print("[BrainFind] v14 GUI loaded, token=" .. MY_TOKEN)
